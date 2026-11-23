@@ -1,5 +1,10 @@
 const API_BASE = "https://dropvid-backend.onrender.com";
 
+const DL_ICON = `
+  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+    <path d="M12 3v13M5 16l7 7 7-7"/><path d="M3 21h18"/>
+  </svg>`;
+
 const grid = document.getElementById("urlGrid");
 for (let i = 0; i < 10; i++) {
   const field = document.createElement("div");
@@ -9,6 +14,14 @@ for (let i = 0; i < 10; i++) {
     <input class="url-input" id="url${i}" type="url" placeholder="https://..." />
   `;
   grid.appendChild(field);
+}
+
+// Video titles/URLs come from other websites, so never put them into the
+// page as raw HTML.
+function esc(value) {
+  return String(value ?? "").replace(/[&<>"']/g, ch => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[ch]));
 }
 
 function getUrls() {
@@ -26,7 +39,7 @@ function showError(msg) {
 function formatDuration(sec) {
   if (!sec) return "";
   const m = Math.floor(sec / 60);
-  const s = sec % 60;
+  const s = Math.floor(sec % 60);
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
@@ -73,8 +86,8 @@ function renderResults(results) {
       card.innerHTML = `
         <span style="color:#f87171;font-size:20px">✕</span>
         <div>
-          <p class="failed-url">${r.url}</p>
-          <p class="failed-reason">${r.error || "Could not fetch this video"}</p>
+          <p class="failed-url">${esc(r.url)}</p>
+          <p class="failed-reason">${esc(r.error || "Could not fetch this video")}</p>
         </div>`;
       container.appendChild(card);
       return;
@@ -94,7 +107,7 @@ function renderResults(results) {
       .map(q => {
         const sizeText = q.size_mb ? ` (~${q.size_mb} MB)` : "";
         const selected = q.value === defaultQuality ? "selected" : "";
-        return `<option value="${q.value}" ${selected}>${q.label}${sizeText}</option>`;
+        return `<option value="${esc(q.value)}" ${selected}>${esc(q.label)}${sizeText}</option>`;
       })
       .join("");
 
@@ -104,22 +117,17 @@ function renderResults(results) {
       <div class="card-index">#${i + 1}</div>
       ${r.thumbnail ? `
         <div class="thumbnail-wrap">
-          <img class="thumbnail" src="${r.thumbnail}" alt="${r.title}" />
+          <img class="thumbnail" src="${esc(r.thumbnail)}" alt="${esc(r.title)}" />
           ${r.duration ? `<span class="duration">${formatDuration(r.duration)}</span>` : ""}
         </div>` : ""}
       <div class="card-info">
-        <p class="platform-badge">${r.platform || ""}</p>
-        <h3 class="video-title">${r.title}</h3>
+        <p class="platform-badge">${esc(r.platform || "")}</p>
+        <h3 class="video-title">${esc(r.title)}</h3>
         <div class="quality-row">
           <select class="quality-select" id="qualitySelect${i}">
             ${qualityOptions}
           </select>
-          <button class="dl-btn" id="dlBtn${i}">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-              <path d="M12 3v13M5 16l7 7 7-7"/><path d="M3 21h18"/>
-            </svg>
-            Download
-          </button>
+          <button class="dl-btn" id="dlBtn${i}">${DL_ICON} Download</button>
         </div>
         <p class="error-msg" id="dlError${i}"></p>
       </div>`;
@@ -129,47 +137,53 @@ function renderResults(results) {
   });
 }
 
+// Hands the actual file transfer to the browser's own download manager
+// (progress bar, pause/resume, no waiting for the whole video to load
+// into the page first). A hidden frame is used so that if anything goes
+// wrong the visitor is never navigated away from the page.
+function startNativeDownload(href) {
+  const frame = document.createElement("iframe");
+  frame.style.display = "none";
+  frame.src = href;
+  document.body.appendChild(frame);
+  setTimeout(() => frame.remove(), 5 * 60 * 1000);
+}
+
 async function downloadVideo(url, index) {
   const btn = document.getElementById(`dlBtn${index}`);
   const errEl = document.getElementById(`dlError${index}`);
   const qualitySelect = document.getElementById(`qualitySelect${index}`);
-  const quality = qualitySelect ? qualitySelect.value : "720";
+  const quality = qualitySelect ? qualitySelect.value : "worst";
 
   btn.disabled = true;
-  btn.innerHTML = `<span class="spinner"></span> Downloading...`;
+  btn.innerHTML = `<span class="spinner"></span> Preparing...`;
+  errEl.style.color = "";
   errEl.textContent = "";
 
   try {
-    const res = await fetch(`${API_BASE}/download`, {
+    const res = await fetch(`${API_BASE}/prepare`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ url, quality }),
     });
 
-    if (!res.ok) {
-      const data = await res.json().catch(() => ({}));
-      throw new Error(data.detail || "Download failed");
-    }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || "Download failed");
 
-    const contentDisposition = res.headers.get("Content-Disposition") || "";
-    const filenameMatch = contentDisposition.match(/filename="?([^"]+)"?/);
-    const ext = filenameMatch ? filenameMatch[1].split(".").pop() : (quality === "audio" ? "mp3" : "mp4");
-    const blob = await res.blob();
-    const blobUrl = window.URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = blobUrl;
-    link.download = `dropvid-${index + 1}.${ext}`;
-    link.click();
-    window.URL.revokeObjectURL(blobUrl);
+    startNativeDownload(`${API_BASE}/file/${data.token}`);
 
+    // Keep the button locked for a few seconds so a second click can't
+    // start a duplicate download, and tell the visitor where to look.
+    btn.innerHTML = `${DL_ICON} Started`;
+    errEl.style.color = "var(--muted)";
+    errEl.textContent = "Your download has started — check your browser's downloads.";
+    await new Promise(resolve => setTimeout(resolve, 5000));
   } catch (e) {
+    errEl.style.color = "";
     errEl.textContent = e.message;
   } finally {
     btn.disabled = false;
-    btn.innerHTML = `
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-        <path d="M12 3v13M5 16l7 7 7-7"/><path d="M3 21h18"/>
-      </svg> Download`;
+    btn.innerHTML = `${DL_ICON} Download`;
   }
 }
 
